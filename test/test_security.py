@@ -1360,6 +1360,32 @@ class TestBuiltinDenyPatterns:
         # ``git remote`` referencing a remote literally named "push".
         assert is_denied("git remote show push") is None
 
+    def test_allows_read_only_mentions_of_the_git_push_identifier(self) -> None:
+        """A command that merely MENTIONS ``git_push`` must be ALLOWED.
+
+        ``_GIT_PUBLISH_GLUE_RE`` matched the bare literal anywhere in the
+        command, so introspecting this codebase's own identifiers -- grepping
+        for the rule name, running the tests named after it, or writing a
+        commit message about it -- was classified as a publish attempt.  Such a
+        command then hits ``_is_push_to_protected_branch``'s fail-closed branch
+        (``_git_push_args`` finds no ``git`` token in ``git_push``, returns
+        ``None``, and the unparseable residue is treated as obfuscation), so
+        the outcome was a deny with no way to tell it from a real push.
+        """
+        from kiro_crew.security import is_denied
+
+        assert is_denied("grep -rn git_push src/") is None
+        assert is_denied("rg git_push") is None
+        assert is_denied("echo git_push") is None
+        assert is_denied("pytest -k git_push") is None
+        assert is_denied('git commit -m "anchor the git_push alternative"') is None
+        # A separator does NOT make a later mention command-position.
+        assert is_denied("echo hi && grep git_push src/") is None
+        # ── The deny must survive for a real command-position invocation ──
+        assert is_denied("git_push") is not None
+        assert is_denied("git_push origin main") is not None
+        assert is_denied("cd /tmp && git_push origin main") is not None
+
     def test_allows_ssh_remote_command_without_publish(self) -> None:
         """A plain ``ssh host '<cmd>'`` whose remote command contains the word
         ``push`` (but is not a real ``git push``) must be ALLOWED.

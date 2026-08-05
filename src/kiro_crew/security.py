@@ -2229,7 +2229,21 @@ _GIT_PUBLISH_RE = re.compile(
 # ``git$(echo ' ')push``, ``git`echo`push``, ``git$()push``.  After stripping
 # empty substitutions/backticks the residue is ``gitpush``; we also match a
 # literal ``git_push`` (kiro-cli historically denied that form).
-_GIT_PUBLISH_GLUE_RE = re.compile(r"git(?:\$\([^)]*\)|`[^`]*`)+push|git_push")
+#
+# The two alternatives are anchored differently ON PURPOSE.  The glue form has
+# to stay unanchored: ``FOO=1 git$(echo)push origin main`` puts a space before
+# ``git``, so requiring a command-position prefix would open a real hole.  The
+# ``git_push`` literal is the opposite case -- it is a single bare token, so an
+# unanchored match also fires on any command that merely MENTIONS the
+# identifier (``rg git_push``, ``pytest -k git_push``), and such a command is
+# then denied because ``_git_push_args`` cannot find a ``git`` token in it and
+# ``_is_push_to_protected_branch`` fails closed on the unparseable residue.
+# Anchoring the literal to command position keeps the deny for a real
+# invocation while letting read-only mentions through.
+_GIT_PUBLISH_GLUE_RE = re.compile(
+    r"git(?:\$\([^)]*\)|`[^`]*`)+push"
+    r"|(?:^|[;&|`\n]|\$\()\s*git_push(?=\s|[)`;&|]|$)"
+)
 
 # Program NAME produced by an expansion the shell resolves to the git binary
 # BEFORE exec, so the literal ``git`` token never appears in the source text and

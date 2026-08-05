@@ -189,6 +189,25 @@ class TestIsGitPublishDetection:
         assert _is_git_publish("git_pus" + "h") is True
         assert _is_git_publish(f"git$(echo ' ')pus{'h'} origin main") is True
 
+    def test_identifier_mention_not_detected(self) -> None:
+        """The ``git_push`` alternative is anchored to command position.
+
+        An unanchored literal fired on any command that merely names the
+        identifier, so read-only introspection of this codebase (``rg``,
+        ``pytest -k``, a commit message) was detected as a publish.  The glue
+        form above stays unanchored on purpose -- ``FOO=1 git$(echo)push`` has
+        a space before ``git`` -- so only the literal is anchored.
+        """
+        IDENT = "git_pus" + "h"
+        assert _is_git_publish(f"rg {IDENT}") is False
+        assert _is_git_publish(f"grep -rn {IDENT} src/") is False
+        assert _is_git_publish(f"pytest -k {IDENT}") is False
+        assert _is_git_publish(f"echo hi && grep {IDENT}") is False
+        # Command position -- including after a separator -- still detected.
+        assert _is_git_publish(IDENT) is True
+        assert _is_git_publish(f"{IDENT} origin main") is True
+        assert _is_git_publish(f"cd /tmp && {IDENT} origin main") is True
+
     def test_program_substitution_evasion_detected(self) -> None:
         # Program NAME produced by an expansion the shell resolves to git before
         # exec -- the literal ``git`` token never appears in the source text.
