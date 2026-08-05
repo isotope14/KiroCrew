@@ -139,6 +139,7 @@ export function ChatPanel() {
     session?: { autocompact_pct?: number }
     agent?: {
       model?: string
+      role_models?: { background?: string; subagent?: string }
       reasoning_effort?: string
       soft_stop_budget_secs?: number
       completion_keep?: CompletionKeepMode
@@ -300,6 +301,32 @@ export function ChatPanel() {
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_default_reasoning_effort')),
   })
 
+  // ── Per-role model defaults (agent.role_models) ──
+  // Same picker as the chat default above; "auto" (or unset) means "inherit the
+  // chat default". Lets an operator run background (lite / heartbeat) or
+  // sub-agent work on a cheaper model without changing the interactive default.
+  const backgroundModel = mcCfg?.agent?.role_models?.background || 'auto'
+  const subagentModel = mcCfg?.agent?.role_models?.subagent || 'auto'
+  // A pinned model the live backend no longer advertises must stay selectable
+  // (same reasoning as the chat-default picker), so prepend it when missing.
+  const roleModelOptions = (current: string): string[] => {
+    const opts = availableModels.map(m => m.name)
+    if (!opts.includes(current)) opts.unshift(current)
+    return opts
+  }
+  const roleModelLabels = (opts: string[]): string[] =>
+    opts.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : m))
+  const backgroundModelMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.role_models.background', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_model')),
+  })
+  const subagentModelMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.role_models.subagent', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_model')),
+  })
+
   // ── Local chat config (localStorage) ──
   const setChat = useCallback(<K extends keyof ChatConfig>(k: K, v: ChatConfig[K]) => {
     setChatCfg(prev => {
@@ -341,6 +368,26 @@ export function ChatPanel() {
             options={modelOptions}
             optionLabels={modelOptions.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : m))}
             onChange={v => defaultModelMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.background_model')}
+            description={i18nT('pages.settings.chatPanel.model_for_background_lite_heartbeat_work')}
+            hint={i18nT('pages.settings.chatPanel.role_model_auto_hint')}
+            value={backgroundModel}
+            options={roleModelOptions(backgroundModel)}
+            optionLabels={roleModelLabels(roleModelOptions(backgroundModel))}
+            onChange={v => backgroundModelMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.subagent_model')}
+            description={i18nT('pages.settings.chatPanel.model_for_spawned_sub_agents')}
+            hint={i18nT('pages.settings.chatPanel.role_model_auto_hint')}
+            value={subagentModel}
+            options={roleModelOptions(subagentModel)}
+            optionLabels={roleModelLabels(roleModelOptions(subagentModel))}
+            onChange={v => subagentModelMut.mutate(v)}
             disabled={!mcQ.isSuccess}
           />
           <SettingsSelect

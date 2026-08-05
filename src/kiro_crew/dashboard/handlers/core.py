@@ -1223,6 +1223,74 @@ def _agent_values() -> set[str]:
     return {"", *KiroCrewConfig.load().agents}
 
 
+def _active_advertised_canonical(request: web.Request) -> set[str] | None:
+    """Canonical-key set the active provider(s) advertise, or None if unknown.
+
+    Mirrors the entitlement source the model picker uses
+    (:func:`handlers.agents._advertised_cc_models`): the advertised set is
+    captured at session init from what the account is actually served. Each
+    advertised provider id is folded to its canonical registry key (and kept in
+    raw form) so an alias-vs-versioned-id spelling mismatch cannot produce a
+    false "not entitled" verdict. Returns ``None`` when no session has
+    initialized / nothing was advertised, so callers treat entitlement as
+    UNKNOWN rather than denying on no evidence.
+    """
+    from kiro_crew import model_registry
+
+    try:
+        state = request.app["state"]
+        providers = state.sessions.active_providers()
+    except (KeyError, AttributeError):
+        return None
+    for provider in providers:
+        getter = getattr(provider, "available_models", None)
+        if not callable(getter):
+            continue
+        try:
+            advertised = getter()
+        except Exception:
+            continue
+        if advertised:
+            out: set[str] = {"auto"}
+            for m in advertised:
+                mid = m.get("modelId", "") if isinstance(m, dict) else ""
+                if not mid:
+                    continue
+                out.add(mid.strip().lower())
+                out.add(model_registry.from_provider_id(mid, "claude_code").strip().lower())
+            return out
+    return None
+
+
+def _validate_role_model(value: str, request: web.Request) -> str | None:
+    """Reject a per-role model pin the account cannot use; ``None`` = allow.
+
+    ``""`` / ``"auto"`` always allow (they defer to the chat default). Otherwise
+    reuse the per-session provider guard (rejects display-only canonical keys for
+    the active provider), then — when a live advertised set is known — reject a
+    model the account was never served, naming what it can use. No advertised set
+    => accept (entitlement unknowable; don't accuse on no evidence), matching the
+    ACP entitlement error path's conservative default.
+    """
+    if not value or value == "auto":
+        return None
+    from kiro_crew import model_registry
+    from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
+
+    reason = _model_rejected_reason(value)
+    if reason:
+        return reason
+    advertised = _active_advertised_canonical(request)
+    if advertised is None:
+        return None
+    canon = model_registry.from_provider_id(value, "claude_code").strip().lower()
+    if value.strip().lower() in advertised or canon in advertised:
+        return None
+    usable = sorted({v for v in advertised if v != "auto"})[:8]
+    listed = ", ".join(usable) if usable else "auto"
+    return f"{value!r} is not available on your account; choose one of: {listed}, or 'auto'."
+
+
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
     # Default model for new sessions. Membership can NOT be validated against a
@@ -1234,6 +1302,22 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # by kiro itself rather than silently accepted here. "auto"/"" = defer to
     # the agent config / kiro's own default.
     "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-\[\]]*$"},
+    # Per-task-class model overrides. Same grammar as agent.model (the real
+    # vocabulary is whatever the backend advertises). "" / "auto" defers to the
+    # chat default. `validate_fn` additionally rejects a well-formed id the
+    # active provider or the account's entitlement cannot honor.
+    "agent.role_models.background": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "validate_fn": _validate_role_model,
+    },
+    "agent.role_models.subagent": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "validate_fn": _validate_role_model,
+    },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     "agent.approval_mode": {"type": "enum", "values": ["auto", "interactive"]},
     # How long an AD-HOC auto-approve grant lasts. Editable from Settings because
@@ -1422,6 +1506,11 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         values_fn = spec.get("values_fn")
         if values_fn and value not in values_fn():
             return _deny(f"invalid value for {path_key}", f"{path_key}={value}")
+        validate_fn = spec.get("validate_fn")
+        if validate_fn:
+            reason = validate_fn(value, request)
+            if reason:
+                return _deny(reason, f"{path_key}={value}")
     else:
         return _deny("unsupported config type", f"{path_key}={value}", 500)
 
@@ -1458,16 +1547,21 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             return web.json_response({"error": "failed to read config file"}, status=500)
 
         parts = path_key.split(".")
-        if len(parts) == 2:
-            section = data.setdefault(parts[0], {})
-            if not isinstance(section, dict):
+        # Walk (creating) intermediate objects, then set the leaf. Handles
+        # arbitrary depth uniformly — 1-level ("auto_update"), 2-level
+        # ("agent.model"), and 3-level ("agent.role_models.background") — instead
+        # of the previous special-cases that would clobber a whole section for a
+        # 3-level key.
+        section = data
+        for part in parts[:-1]:
+            nxt = section.setdefault(part, {})
+            if not isinstance(nxt, dict):
                 _log_sel("error", f"{path_key}=section_not_dict")
                 return web.json_response(
-                    {"error": f"config section '{parts[0]}' is not an object"}, status=500
+                    {"error": f"config section '{part}' is not an object"}, status=500
                 )
-            section[parts[1]] = value
-        else:
-            data[parts[0]] = value
+            section = nxt
+        section[parts[-1]] = value
 
         try:
             cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1515,6 +1609,22 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         state = request.app["state"]
         await state.sessions.refresh_defaults()
         logger.info("%s set to %r — session defaults refreshed", path_key, value)
+
+    # The background role model is baked into the lite / heartbeat kiro specs at
+    # agent-build time, so a change must rewrite them to take effect without a
+    # restart. The subagent role is read live at spawn (_subagent_default_model),
+    # so it needs no rebuild. Chat-default inheritance for both roles is picked
+    # up by the refresh_defaults above when agent.model changes.
+    if path_key == "agent.role_models.background":
+        try:
+            from kiro_crew.agent import rebuild_agent_config
+
+            await asyncio.to_thread(rebuild_agent_config)
+            logger.info(
+                "agent.role_models.background set to %r — background agent specs rebuilt", value
+            )
+        except Exception:
+            logger.warning("background-model rebuild failed", exc_info=True)
 
     # If completion-keep mode or budget changed, propagate to the live
     # SubagentManager so the next subagent to complete uses the new value.

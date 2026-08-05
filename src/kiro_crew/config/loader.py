@@ -224,6 +224,35 @@ def normalize_agent_model(model: object) -> str:
     return "" if m == DEFAULT_MODEL else m
 
 
+# Per-task-class model overrides (agent.role_models). These are the ONLY
+# sanctioned place to pin a model for a class of work — never hardcode a model
+# id in code. Every role defaults to "" ("inherit"), which resolves down to
+# agent.model and finally to DEFAULT_MODEL ("auto"), so an unpinned role is
+# entitlement-safe on every subscription tier (the provider picks a served
+# model). An operator who deliberately wants a cheaper model for background /
+# sub-agent work pins it here without changing the interactive chat default.
+ROLE_MODEL_KEYS: tuple[str, ...] = ("background", "subagent")
+
+
+def coerce_role_models(raw: object) -> dict[str, str]:
+    """Normalize the per-role model map from hand-edited config / request bodies.
+
+    Only the known :data:`ROLE_MODEL_KEYS` are kept; each value passes through
+    :func:`normalize_agent_model`, so an ``"auto"`` or non-string entry collapses
+    to ``""`` ("inherit the next tier down"). Empty results are dropped so the
+    stored map only ever carries real pins — a role absent from the map and a
+    role explicitly set to ``"auto"`` behave identically (both inherit).
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for role in ROLE_MODEL_KEYS:
+        val = normalize_agent_model(raw.get(role))
+        if val:
+            out[role] = val
+    return out
+
+
 _DEFAULT_PORT = 5476
 
 # KIROCREW_PORT is validated at CLI entry (cli.py main()).
@@ -741,6 +770,19 @@ class AgentConfig:
         default=DEFAULT_MODEL,
         metadata=_meta("Model", "LLM model identifier. 'auto' resolves from agent config."),
     )
+    role_models: dict[str, str] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Per-role models",
+            "Optional per-task-class model overrides. Keys: 'background' "
+            "(lite / heartbeat background workers) and 'subagent' (spawned "
+            "sub-agents). An empty value or 'auto' defers to the chat default "
+            "(agent.model) and then to the provider default, so an unpinned "
+            "role stays usable on every subscription tier. Pin a cheaper model "
+            "here to run background / sub-agent work on it without changing the "
+            "interactive chat default.",
+        ),
+    )
     reasoning_effort: str = field(
         default="",
         metadata=_meta(
@@ -1091,6 +1133,25 @@ class AgentConfig:
                 clamped,
             )
             self.soft_stop_budget_secs = clamped
+        # Keep only known role keys, each normalized ("auto"/non-str -> "").
+        # Defensive for directly-constructed instances; the load() path already
+        # feeds coerced input.
+        self.role_models = coerce_role_models(self.role_models)
+
+    def resolve_model(self, role: str) -> str:
+        """Effective model id for a task ``role``.
+
+        Resolution chain (most-specific first; ``""``/``"auto"`` defers down):
+        ``role_models[role]`` -> ``model`` (interactive chat default) ->
+        :data:`DEFAULT_MODEL` (``"auto"``). ``"auto"`` is a sentinel the provider
+        resolves server-side against what the account is actually served, so an
+        unpinned role never steers an unentitled model onto any tier. Callers
+        that write a kiro agent spec / cc_model store this verbatim.
+        """
+        pin = normalize_agent_model(self.role_models.get(role, ""))
+        if pin:
+            return pin
+        return normalize_agent_model(self.model) or DEFAULT_MODEL
 
 
 @dataclass
@@ -4385,6 +4446,7 @@ class KiroCrewConfig:
                 approval_mode=agent_data.get("approval_mode", "auto"),
                 streaming=agent_data.get("streaming", True),
                 model=agent_data.get("model", DEFAULT_MODEL),
+                role_models=coerce_role_models(agent_data.get("role_models")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
                 default_agent=agent_data.get("default_agent", ""),
