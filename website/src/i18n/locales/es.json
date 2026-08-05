@@ -8990,6 +8990,24 @@
     "worldsPopout": {
       "hide_controls": "Ocultar los controles",
       "show_controls": "Mostrar los controles"
+    },
+    "sessionMemoryCard": {
+      "agent": "Agente",
+      "cpu": "CPU",
+      "filter_sessions": "Filtrar sesiones…",
+      "footer_summary": "{{runtimes}} entornos · {{sessions}} sesiones · {{tasks}} tareas en ejecución · {{headroom}} de margen del host",
+      "host_share": "Cuota del host",
+      "mcp": "MCP",
+      "memory": "Memoria",
+      "no_active_sessions": "No hay sesiones activas",
+      "peak": "Pico",
+      "pid": "PID",
+      "proc": "Proc",
+      "resident_memory_of_each_session_s_whole_process": "Memoria residente de todo el árbol de procesos de cada sesión, incluidos sus servidores MCP. Las páginas compartidas se cuentan una vez por proceso, por lo que cada fila es un límite superior. Una fila marcada como compartida se ejecuta dentro del runtime de otra sesión, así que su cifra es la medición de ese runtime dividida entre ambas, no un valor exclusivo.",
+      "session_task": "Sesión / Tarea",
+      "session_task_memory": "Memoria de sesiones y tareas",
+      "shared": "en común",
+      "uptime": "Tiempo activo"
     }
   },
   "privacyDisclosure": {

@@ -8900,6 +8900,24 @@
     "worldsPopout": {
       "hide_controls": "কন্ট্রোল লুকাও",
       "show_controls": "কন্ট্রোল দেখাও"
+    },
+    "sessionMemoryCard": {
+      "agent": "এজেন্ট",
+      "cpu": "CPU",
+      "filter_sessions": "সেশন ফিল্টার করুন…",
+      "footer_summary": "{{runtimes}} রানটাইম · {{sessions}} সেশন · {{tasks}} টাস্ক চলছে · {{headroom}} হোস্ট হেডরুম",
+      "host_share": "হোস্ট শেয়ার",
+      "mcp": "MCP",
+      "memory": "স্মৃতি",
+      "no_active_sessions": "কোনো সক্রিয় সেশন নেই",
+      "peak": "সর্বোচ্চ",
+      "pid": "PID",
+      "proc": "প্রসেস",
+      "resident_memory_of_each_session_s_whole_process": "প্রতিটি সেশনের সম্পূর্ণ প্রসেস ট্রি-র রেসিডেন্ট মেমরি, এর MCP সার্ভার সহ। শেয়ার করা পেজ প্রতি প্রসেসে একবার গণনা হয়, তাই প্রতিটি সারি একটি ঊর্ধ্বসীমা। শেয়ার চিহ্নিত সারি অন্য একটি সেশনের রানটাইমের ভিতরে চলে, তাই এর মান সেই রানটাইমের পরিমাপ দুইয়ের মধ্যে ভাগ করা, একচেটিয়া নয়।",
+      "session_task": "সেশন / টাস্ক",
+      "session_task_memory": "সেশন ও টাস্ক মেমরি",
+      "shared": "শেয়ার করা",
+      "uptime": "আপটাইম"
     }
   },
   "privacyDisclosure": {

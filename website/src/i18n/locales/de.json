@@ -8900,6 +8900,24 @@
     "worldsPopout": {
       "hide_controls": "Steuerung ausblenden",
       "show_controls": "Steuerung anzeigen"
+    },
+    "sessionMemoryCard": {
+      "agent": "Agent",
+      "cpu": "CPU",
+      "filter_sessions": "Sitzungen filtern…",
+      "footer_summary": "{{runtimes}} Runtimes · {{sessions}} Sitzungen · {{tasks}} laufende Aufgaben · {{headroom}} Host-Reserve",
+      "host_share": "Host-Anteil",
+      "mcp": "MCP",
+      "memory": "Erinnerung",
+      "no_active_sessions": "Keine aktiven Sitzungen",
+      "peak": "Spitze",
+      "pid": "PID",
+      "proc": "Proz",
+      "resident_memory_of_each_session_s_whole_process": "Residenter Speicher des gesamten Prozessbaums jeder Sitzung, einschließlich ihrer MCP-Server. Gemeinsam genutzte Seiten werden pro Prozess einmal gezählt, daher ist jede Zeile eine Obergrenze. Eine als geteilt markierte Zeile läuft in der Runtime einer anderen Sitzung, ihr Wert ist also die Messung dieser Runtime aufgeteilt zwischen beiden und kein exklusiver Wert.",
+      "session_task": "Sitzung / Aufgabe",
+      "session_task_memory": "Sitzungs- und Aufgabenspeicher",
+      "shared": "geteilt",
+      "uptime": "Laufzeit"
     }
   },
   "privacyDisclosure": {
