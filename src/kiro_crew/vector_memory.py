@@ -130,12 +130,29 @@ _MMR_MAX_POOL = 1000
 _SEMANTIC_VECTOR_WEIGHT = 0.6  # weight for vector score in hybrid semantic retrieval
 _SEMANTIC_KEYWORD_WEIGHT = 0.4  # weight for keyword score in hybrid semantic retrieval
 
-_snowball = _snowball_stemmer("english")
+# ``snowballstemmer``'s stemmer keeps its whole parse position on the instance
+# (``current``, ``cursor``, ``limit``, ``bra``/``ket``), so one shared instance is
+# NOT thread-safe: concurrent ``stemWords`` calls interleave those cursors and the
+# stemmer indexes past the end of another thread's word, raising
+# ``IndexError: string index out of range``. Prompt assembly reaches this from
+# ``get_semantic_context`` once per candidate row while other threads assemble
+# their own prompts, so the shared instance is reachable in normal operation.
+# One instance per thread costs a few KB and removes the shared state entirely.
+_snowball_local = threading.local()
+
+
+def _thread_snowball():
+    """Return this thread's own stemmer, creating it on first use."""
+    stemmer = getattr(_snowball_local, "stemmer", None)
+    if stemmer is None:
+        stemmer = _snowball_stemmer("english")
+        _snowball_local.stemmer = stemmer
+    return stemmer
 
 
 def _stem_words(words: set[str]) -> set[str]:
     """Stem a set of words, returning both original and stemmed forms."""
-    return words | set(_snowball.stemWords(list(words)))
+    return words | set(_thread_snowball().stemWords(list(words)))
 
 
 _BUILTIN_PREFIXES = [
@@ -460,6 +477,34 @@ class VectorMemoryStore:
             raise RuntimeError("VectorMemoryStore not initialized — call init() first")
         return self._db
 
+    # ── Locked read helpers ──
+    #
+    # The sqlite3 connection is a process-wide singleton opened with
+    # ``check_same_thread=False`` and shared by every caller: the dashboard
+    # session, each subagent, and history consolidation all assemble prompts on
+    # the same ``mc-embed`` thread pool (``run_in_embed_pool``), and every one of
+    # them reads semantic memory / lessons on the way. Two threads stepping one
+    # connection raise ``sqlite3.InterfaceError: bad parameter or other API
+    # misuse``, which for a subagent lands in prompt assembly and kills the run
+    # before its first turn.
+    #
+    # Writes were already serialized on ``_db_lock``; these helpers extend the
+    # same lock to the read paths. The cursor is drained INSIDE the lock — a
+    # cursor handed back un-fetched would keep stepping the connection after the
+    # lock was released, which is the bug all over again. Per the ``_db_lock``
+    # contract the lock is never held across a blocking embed call: callers embed
+    # before or after, never inside.
+
+    def _fetchall(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        """Run a read query under ``_db_lock`` and return every row."""
+        with self._db_lock:
+            return self.db.execute(sql, params).fetchall()
+
+    def _fetchone(self, sql: str, params: tuple = ()) -> sqlite3.Row | None:
+        """Run a read query under ``_db_lock`` and return the first row."""
+        with self._db_lock:
+            return self.db.execute(sql, params).fetchone()
+
     # ── Key Validation ──
 
     def _validate_key(self, key: str) -> str | None:
@@ -531,9 +576,9 @@ class VectorMemoryStore:
 
     def get_semantic(self, key: str) -> dict | None:
         """Get a single semantic memory entry by key."""
-        row = self.db.execute(
+        row = self._fetchone(
             "SELECT * FROM semantic_memory WHERE key = ? AND is_deleted = 0", (key,)
-        ).fetchone()
+        )
         return dict(row) if row else None
 
     def get_all_semantic(self, limit: int | None = None, offset: int = 0) -> list[dict]:
@@ -550,7 +595,7 @@ class VectorMemoryStore:
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             params = (int(limit), int(offset))
-        rows = self.db.execute(sql, params).fetchall()
+        rows = self._fetchall(sql, params)
         return [dict(r) for r in rows]
 
     @timed("vector", "write")
@@ -806,10 +851,10 @@ class VectorMemoryStore:
     @timed("vector", "search")
     def search_semantic(self, prefix: str) -> list[dict]:
         """Search semantic memory by key prefix."""
-        rows = self.db.execute(
+        rows = self._fetchall(
             "SELECT * FROM semantic_memory WHERE key LIKE ? AND is_deleted = 0 ORDER BY key",
             (prefix.rstrip("*").rstrip(".") + "%",),
-        ).fetchall()
+        )
         return [dict(r) for r in rows]
 
     # ── Context Injection ──
@@ -828,10 +873,10 @@ class VectorMemoryStore:
             query_words = _stem_words(set(re.findall(r"\w+", query_text.lower())))
             query_embedding = self._try_embed(query_text) if self.embed_fn else None
 
-            all_rows = self.db.execute(
+            all_rows = self._fetchall(
                 "SELECT key, value_json, updated_at FROM semantic_memory "
                 "WHERE is_deleted = 0 AND key NOT LIKE 'lesson.%'"
-            ).fetchall()
+            )
 
             scored_rows: list[tuple[float, dict]] = []
             for r in all_rows:
@@ -869,11 +914,11 @@ class VectorMemoryStore:
             rows = [r[1] for r in scored_rows[:max_rows]]
         else:
             # No query: recent entries
-            rows = self.db.execute(
+            rows = self._fetchall(
                 "SELECT key, value_json FROM semantic_memory WHERE is_deleted = 0 "
                 "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC LIMIT ?",
                 (max_rows,),
-            ).fetchall()
+            )
 
         if not rows:
             return ""
@@ -928,10 +973,10 @@ class VectorMemoryStore:
 
     def get_events(self, limit: int = 50, offset: int = 0) -> list[dict]:
         """Return recent memory events with pagination."""
-        rows = self.db.execute(
+        rows = self._fetchall(
             "SELECT * FROM memory_events ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset),
-        ).fetchall()
+        )
         return [dict(r) for r in rows]
 
     def rotate_events(self, max_rows: int = _MAX_EVENTS) -> int:
@@ -957,10 +1002,10 @@ class VectorMemoryStore:
             return 0
         self._faiss_index = faiss.IndexFlatIP(self._embedding_dim)
         self._faiss_id_map = []
-        rows = self.db.execute(
+        rows = self._fetchall(
             "SELECT id, embedding FROM episodic_memories "
             "WHERE is_deleted = 0 AND embedding IS NOT NULL"
-        ).fetchall()
+        )
         skipped = 0
         for row in rows:
             vec = np.frombuffer(row["embedding"], dtype=np.float32).reshape(1, -1)
@@ -1548,12 +1593,12 @@ class VectorMemoryStore:
         else:
             tag_conds = ""
             tag_params = ()
-        rows = self.db.execute(
+        rows = self._fetchall(
             "SELECT id, conversation_id, text, tags, importance, created_at, last_accessed_at "
             f"FROM episodic_memories WHERE is_deleted = 0{tag_conds} "
             "ORDER BY created_at DESC LIMIT ? OFFSET ?",
             (*tag_params, limit, offset),
-        ).fetchall()
+        )
         return [dict(r) for r in rows]
 
     def delete_episodic(self, mem_id: str, source: str = "user_explicit") -> bool:
@@ -1608,7 +1653,7 @@ class VectorMemoryStore:
 
     def memory_stats(self) -> dict:
         """Return counts and sizes for dashboard display."""
-        row = self.db.execute(
+        row = self._fetchone(
             "SELECT "
             "(SELECT COUNT(*) FROM semantic_memory WHERE is_deleted=0) AS sem_active, "
             "(SELECT COUNT(*) FROM semantic_memory WHERE is_deleted=1) AS sem_deleted, "
@@ -1616,16 +1661,19 @@ class VectorMemoryStore:
             "(SELECT COUNT(*) FROM episodic_memories WHERE is_deleted=1) AS ep_deleted, "
             "(SELECT COUNT(*) FROM memory_events) AS events_count, "
             "(SELECT COUNT(*) FROM episodic_memories WHERE is_deleted=0 AND embedding IS NOT NULL) AS ep_with_vec"
-        ).fetchone()
+        )
+        # A bare aggregate SELECT always yields exactly one row, but _fetchone is
+        # typed Optional; fall back to zeros rather than raise on a stats read.
+        counts = row if row is not None else (0, 0, 0, 0, 0, 0)
         faiss_size = len(self._faiss_id_map) if self._faiss_id_map else 0
         return {
-            "semantic_active": row[0],
-            "semantic_deleted": row[1],
-            "episodic_active": row[2],
-            "episodic_deleted": row[3],
-            "events_count": row[4],
+            "semantic_active": counts[0],
+            "semantic_deleted": counts[1],
+            "episodic_active": counts[2],
+            "episodic_deleted": counts[3],
+            "events_count": counts[4],
             "faiss_index_size": faiss_size,
-            "embedded_count": row[5],
+            "embedded_count": counts[5],
         }
 
     # ── Episodic Helpers ──
@@ -1638,9 +1686,9 @@ class VectorMemoryStore:
         return bool(set(t.lower() for t in entry_tags) & set(t.lower() for t in tag_filter))
 
     def _get_episodic(self, mem_id: str) -> dict | None:
-        row = self.db.execute(
+        row = self._fetchone(
             "SELECT * FROM episodic_memories WHERE id = ? AND is_deleted = 0", (mem_id,)
-        ).fetchone()
+        )
         return dict(row) if row else None
 
     #: Columns returned for episodic search hits. Deliberately omits the
@@ -1662,11 +1710,11 @@ class VectorMemoryStore:
         if not mem_ids:
             return {}
         placeholders = ",".join("?" * len(mem_ids))
-        rows = self.db.execute(
+        rows = self._fetchall(
             f"SELECT {self._EPISODIC_SEARCH_COLUMNS} FROM episodic_memories "
             f"WHERE id IN ({placeholders}) AND is_deleted = 0",
             tuple(mem_ids),
-        ).fetchall()
+        )
         return {row["id"]: dict(row) for row in rows}
 
     #: Minimum interval between last_accessed_at writes for the same episodic row.
@@ -1991,9 +2039,9 @@ class VectorMemoryStore:
         )
         if limit is not None and limit > 0:
             sql += " LIMIT ?"
-            rows = self.db.execute(sql, (limit,)).fetchall()
+            rows = self._fetchall(sql, (limit,))
         else:
-            rows = self.db.execute(sql).fetchall()
+            rows = self._fetchall(sql)
         return [dict(r) for r in rows]
 
     def delete_lesson(self, rule_substring: str) -> bool:
@@ -2584,9 +2632,10 @@ class VectorMemoryStore:
                     else:
                         counts["skipped"] += 1
 
-        embedded_n = self.db.execute(
+        embedded_row = self._fetchone(
             "SELECT COUNT(*) FROM episodic_memories WHERE is_deleted=0 AND embedding IS NOT NULL"
-        ).fetchone()[0]
+        )
+        embedded_n = embedded_row[0] if embedded_row is not None else 0
         logger.info(
             "Migration complete: semantic=%d episodic=%d skipped=%d embedded=%d",
             counts["semantic"],
@@ -2670,11 +2719,11 @@ class VectorMemoryStore:
             return 0
 
         promoted = 0
-        rows = self.db.execute(
+        rows = self._fetchall(
             "SELECT id, text, embedding FROM episodic_memories "
             "WHERE is_deleted = 0 AND embedding IS NOT NULL "
             "ORDER BY importance DESC, created_at DESC LIMIT 500"
-        ).fetchall()
+        )
 
         # Cluster similar episodic memories
         clusters: dict[int, list[dict]] = {}
@@ -2739,13 +2788,13 @@ class VectorMemoryStore:
         FAISS dedup, so counting episodic there would conflate benign
         deduplication with policy rejections.
         """
-        rows = self.db.execute(
+        rows = self._fetchall(
             "SELECT event_type, COUNT(*) as count FROM memory_events "
             "WHERE event_type = 'injection_blocked' "
             "OR (memory_type = 'semantic' AND event_type IN "
             "('allowlist_reject', 'low_confidence', 'conflict_skip')) "
             "GROUP BY event_type"
-        ).fetchall()
+        )
         return {r["event_type"]: r["count"] for r in rows}
 
     def get_context_preview(self, query_text: str = "") -> dict:

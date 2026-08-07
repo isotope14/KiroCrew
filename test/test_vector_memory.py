@@ -19,6 +19,7 @@ from kiro_crew.vector_memory import (
     _jaccard,
     _mmr_rerank,
     _stem_words,
+    _thread_snowball,
     _tokenize,
 )
 
@@ -815,6 +816,84 @@ class TestStemWords:
     def test_short_words_unchanged(self) -> None:
         result = _stem_words({"bug", "run", "fix"})
         assert {"bug", "run", "fix"} <= result
+
+    def test_stemmer_instance_is_per_thread(self) -> None:
+        """Each thread must get its own stemmer -- the deterministic guard.
+
+        ``snowballstemmer`` keeps its parse position on the instance
+        (``current``, ``cursor``, ``bra``/``ket``), so a module-level shared
+        stemmer is not thread-safe. This asserts the invariant directly rather
+        than waiting for contention to expose it.
+
+        The barrier keeps all four threads alive at once. Without it a thread
+        could exit before the next starts, and the assertion would be comparing
+        stemmers that never coexisted -- a shared instance would then look fine.
+
+        The stemmers themselves are retained, not their ``id()``: once a thread
+        exits its thread-local stemmer is freed and CPython reuses the address,
+        so comparing ids collected over time reports false collisions. Holding a
+        strong reference to each keeps every object alive, making identity
+        comparison sound.
+        """
+        n_threads = 4
+        barrier = threading.Barrier(n_threads)
+        stemmers: list[object | None] = [None] * n_threads
+
+        def grab(slot: int) -> None:
+            barrier.wait(timeout=10)
+            stemmers[slot] = _thread_snowball()
+
+        threads = [threading.Thread(target=grab, args=(i,)) for i in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert all(s is not None for s in stemmers), "a thread never reported"
+        distinct = {id(s) for s in stemmers}
+        assert len(distinct) == n_threads, (
+            "concurrent threads shared a stemmer instance: "
+            f"{len(distinct)} distinct for {n_threads} threads"
+        )
+        # Same thread, called twice -> cached, not rebuilt per call.
+        assert _thread_snowball() is _thread_snowball()
+
+    def test_concurrent_stemming_does_not_corrupt(self) -> None:
+        """Concurrent ``_stem_words`` must not raise or drop stems.
+
+        Against a shared stemmer this raised
+        ``IndexError: string index out of range`` -- one thread's cursor walked
+        off the end of another thread's word.
+        """
+        words = {
+            "consolidation",
+            "transactions",
+            "locking",
+            "findings",
+            "revisions",
+            "assembly",
+        }
+        expected = _stem_words(words)
+        errors: list[BaseException] = []
+        mismatches: list[set[str]] = []
+
+        def worker() -> None:
+            try:
+                for _ in range(300):
+                    got = _stem_words(set(words))
+                    if got != expected:
+                        mismatches.append(got)
+            except BaseException as exc:  # noqa: BLE001 - capture any thread crash
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"concurrent stemming raised: {errors!r}"
+        assert not mismatches, f"concurrent stemming produced wrong stems: {mismatches[:2]!r}"
 
 
 class TestEmbedFnLazyRebind:
@@ -2034,31 +2113,34 @@ class _AuditingConnection:
     transaction``. Holding ``_db_lock`` across every DML statement is what
     prevents it, so this proxy audits that discipline directly.
 
-    Reads are audited too, but only the two episodic-search fetches, which the
-    context-assembly path runs concurrently with memory writes. sqlite3 caches
-    prepared statements per connection, so a SELECT that overlaps another
-    statement can have its row iteration corrupted — that surfaced on Windows
-    CI as a NULL ``embedding`` from a query filtering ``embedding IS NOT NULL``,
-    raising ``TypeError`` on ``len()``. The other read methods are deliberately
-    NOT audited: they run unlocked by design and widening the audit to them
-    would assert an invariant this change does not establish.
-    """
+    Every statement routed through ``execute`` is audited, reads included.
+    sqlite3 caches prepared statements per connection, so a SELECT overlapping
+    another statement can have its row iteration corrupted or fail outright with
+    ``InterfaceError: bad parameter or other API misuse``. That is not
+    hypothetical: it killed subagents during prompt assembly, because the
+    dashboard session, every subagent and history consolidation all read
+    semantic memory and lessons on the same ``mc-embed`` thread pool over this
+    one shared connection. The read paths now go through
+    ``VectorMemoryStore._fetchall`` / ``_fetchone``, which take the lock and
+    drain the cursor inside it, so the invariant is total and this audit no
+    longer needs a read allowlist.
 
-    _DML = ("INSERT", "UPDATE", "DELETE", "REPLACE", "BEGIN")
-    _GUARDED_READS = ("embedding IS NOT NULL", "text LIKE ?")
+    Scope limit: only ``execute`` is proxied. ``executemany`` and ``commit``
+    fall through ``__getattr__`` unaudited, so a lock violation reaching sqlite
+    by those routes would not be reported here.
+
+    ``init()`` statements never reach this proxy — it is installed after
+    ``store.init()`` returns, and init runs before the store is published to
+    any other thread.
+    """
 
     def __init__(self, inner: object, lock: _TrackingLock, violations: list[str]) -> None:
         self._inner = inner
         self._lock = lock
         self._violations = violations
 
-    def _must_be_locked(self, sql: str) -> bool:
-        if sql.lstrip().upper().startswith(self._DML):
-            return True
-        return any(frag in sql for frag in self._GUARDED_READS)
-
     def execute(self, sql: str, *args: object, **kwargs: object) -> object:
-        if self._must_be_locked(sql) and not self._lock.held:
+        if not self._lock.held:
             self._violations.append(sql.strip()[:80])
         return self._inner.execute(sql, *args, **kwargs)  # type: ignore[attr-defined]
 
@@ -2119,6 +2201,110 @@ class TestSharedConnectionLockDiscipline:
         store.rotate_events(max_rows=1)
 
         assert violations == [], f"statement issued without _db_lock held: {violations}"
+
+    def test_prompt_assembly_reads_hold_db_lock(self, tmp_path: Path) -> None:
+        """Every read a prompt build performs must hold ``_db_lock``.
+
+        These are the methods on the subagent startup path
+        (``build_message`` -> ``build_session_context`` -> ``MemoryStore.get_context``
+        -> ``get_semantic_context`` / ``get_lessons``). They ran unlocked, so a
+        subagent whose prompt build overlapped another thread's statement on the
+        shared connection died with ``InterfaceError`` before its first turn.
+        The dashboard read paths are included: they share the same connection.
+        """
+        dim = 16
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=dim)
+        store.init()
+        embed = self._fake_embed(dim)
+        store.embed_fn = embed
+        store.set_semantic("project.alpha.status", "in progress", 0.9, "consolidation")
+        store.write_lesson("prefer explicit transactions over implicit ones")
+        text = "the findings doc for topic alpha was written to disk"
+        store.write_episodic(text, embedding=embed(text))
+
+        violations = self._instrument(store)
+
+        # Prompt-assembly reads.
+        store.get_semantic_context()
+        store.get_semantic_context(query_text="alpha status findings")
+        store.get_lessons()
+        store.get_lessons(limit=5)
+        store.get_semantic("project.alpha.status")
+        # Dashboard / maintenance reads on the same connection.
+        store.get_all_semantic()
+        store.get_all_semantic(limit=5, offset=0)
+        store.search_semantic("project.*")
+        store.get_events(limit=5)
+        store.get_episodic_list(limit=5)
+        store.memory_stats()
+        store.get_rejection_stats()
+        store.get_context_preview(query_text="alpha")
+        store.promote_episodic_patterns()
+
+        assert violations == [], f"read issued without _db_lock held: {violations}"
+
+    def test_concurrent_prompt_assembly_and_consolidation(self, tmp_path: Path) -> None:
+        """Prompt assembly must survive concurrent consolidation writes.
+
+        Several threads assemble prompts (``get_semantic_context`` +
+        ``get_lessons``, what ``build_message`` does off the ``mc-embed`` pool)
+        while another consolidates memory.
+
+        Load-dependent reproduction. Run alone against unlocked read paths it
+        usually passes -- the per-statement collision window is narrow. Run as
+        part of the full suite (xdist, machine under load) it failed on
+        ``AttributeError: 'NoneType' object has no attribute 'lower'``: an
+        overlapped SELECT handed back a row with NULL in ``value_json``, a column
+        the schema never allows to be NULL. That is the important half of the
+        bug -- the unlocked reads do not merely raise ``InterfaceError``, they
+        can return CORRUPT ROWS that callers then use as if valid.
+
+        Because it needs contention to trip, it is a supporting test, not the
+        guard. ``test_prompt_assembly_reads_hold_db_lock`` is the deterministic
+        guard: it asserts the lock invariant directly and fails every time a
+        read path is left unlocked.
+        """
+        dim = 16
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=dim)
+        store.init()
+        embed = self._fake_embed(dim)
+        store.embed_fn = embed
+        for i in range(20):
+            store.set_semantic(f"project.topic{i}.status", f"state {i}", 0.9, "consolidation")
+        for i in range(5):
+            store.write_lesson(f"lesson number {i} about explicit transactions and locking")
+
+        errors: list[BaseException] = []
+
+        def _prompt_builder() -> None:
+            try:
+                for _ in range(30):
+                    store.get_semantic_context(query_text="topic status project state")
+                    store.get_lessons()
+            except BaseException as exc:  # noqa: BLE001 - capture any thread crash
+                errors.append(exc)
+
+        def _consolidator() -> None:
+            try:
+                for i in range(30):
+                    store.set_semantic(
+                        "project.topic0.status", f"revision {i}", 0.9, "consolidation"
+                    )
+                    text = f"consolidated note {i} about topic status and project state"
+                    store.write_episodic(text, embedding=embed(text))
+            except BaseException as exc:  # noqa: BLE001 - capture any thread crash
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_prompt_builder) for _ in range(4)]
+        threads.append(threading.Thread(target=_consolidator))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"concurrent prompt assembly / consolidation raised: {errors!r}"
+        assert store.get_semantic("project.topic0.status") is not None
+        assert store.get_lessons()
 
     def test_concurrent_search_and_semantic_write(self, tmp_path: Path) -> None:
         """Consolidation-style writes must survive concurrent context assembly.
