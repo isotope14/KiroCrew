@@ -95,7 +95,7 @@ export function SettingsPage({
   const [busy, setBusy] = useState(false)
   // Messages are scoped to the control that produced them, so feedback appears
   // where the click happened rather than at the foot of the page.
-  const [patNote, setPatNote] = useState<string | null>(null)
+  const [patNote, setPatNote] = useState<{ text: string; error?: boolean } | null>(null)
   const [knowledgeMsg, setKnowledgeMsg] = useState<
     Record<string, { text: string; error?: boolean } | null>
   >({})
@@ -174,6 +174,32 @@ export function SettingsPage({
       }
     },
     [onSetKnowledge],
+  )
+
+  // Both token buttons go through here, because the failure handling is the
+  // whole point: `onSetPat` rejects when the host rejects the write, and an
+  // unguarded `await` left `busy` latched true — disabling BOTH buttons for the
+  // rest of the page's life — while reporting nothing at all. `finally` releases
+  // the buttons on every path, and the reason is shown where the click happened.
+  //
+  // The field is deliberately NOT cleared on failure: the token the user pasted
+  // is the only copy they have in hand, and retrying should not mean pasting it
+  // again.
+  const writePat = useCallback(
+    async (next: string, okText: string) => {
+      setBusy(true)
+      setPatNote(null)
+      try {
+        await onSetPat(next)
+        if (next) setPat('')
+        setPatNote({ text: okText })
+      } catch (e) {
+        setPatNote({ text: e instanceof Error ? e.message : String(e), error: true })
+      } finally {
+        setBusy(false)
+      }
+    },
+    [onSetPat],
   )
 
   // Escape leaves the page. No outside-click dismissal — this is a page, so a
@@ -544,8 +570,13 @@ export function SettingsPage({
                       const id = confirmForget
                       setConfirmForget(null)
                       setBusy(true)
-                      await onForget(id)
-                      setBusy(false)
+                      try {
+                        await onForget(id)
+                      } finally {
+                        // `busy` also gates the token buttons below, so leaking it
+                        // here would disable Save/Clear as collateral damage.
+                        setBusy(false)
+                      }
                     }}
                     style={{
                       ...pill(false),
@@ -596,13 +627,9 @@ export function SettingsPage({
               <button
                 type="button"
                 disabled={busy || !pat}
-                onClick={async () => {
-                  setBusy(true)
-                  await onSetPat(pat)
-                  setPat('')
-                  setPatNote(i18nT('apps.mdNotebook.settings.tokenSaved'))
-                  setBusy(false)
-                }}
+                onClick={() =>
+                  void writePat(pat, i18nT('apps.mdNotebook.settings.tokenSaved'))
+                }
                 style={pill(true)}
               >
                 {i18nT('apps.mdNotebook.settings.save')}
@@ -611,25 +638,29 @@ export function SettingsPage({
                 <button
                   type="button"
                   disabled={busy}
-                  onClick={async () => {
-                    setBusy(true)
-                    await onSetPat('')
-                    setPatNote(i18nT('apps.mdNotebook.settings.tokenCleared'))
-                    setBusy(false)
-                  }}
+                  onClick={() =>
+                    void writePat('', i18nT('apps.mdNotebook.settings.tokenCleared'))
+                  }
                   style={pill(false)}
                 >
                   {i18nT('apps.mdNotebook.settings.clear')}
                 </button>
               )}
             </div>
-            {/* Result under the token controls, not at the foot of the page. */}
+            {/* Result under the token controls, not at the foot of the page. A
+                failure is an alert, not a status, so a screen reader announces it
+                without the user having to go looking for it. */}
             {patNote && (
               <div
-                role="status"
-                style={{ fontSize: '11px', color: ACCENT, marginTop: '6px' }}
+                role={patNote.error ? 'alert' : 'status'}
+                style={{
+                  fontSize: '11px',
+                  lineHeight: 1.45,
+                  color: patNote.error ? 'var(--danger)' : ACCENT,
+                  marginTop: '6px',
+                }}
               >
-                {patNote}
+                {patNote.text}
               </div>
             )}
           </div>
