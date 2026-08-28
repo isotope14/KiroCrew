@@ -28,7 +28,10 @@ const PREV = path.join("/logs", NATIVE_LOG_PREVIOUS_BASENAME);
  *
  * Also models the three things the credential-hygiene path needs: file CONTENT
  * (so a redaction can be observed), file MODE (so a tightening can be), and
- * `wx` create semantics (so "must not truncate an existing log" is testable).
+ * `wx` create semantics on BOTH `openSync` and `writeFileSync` (so "must not
+ * truncate an existing log" and "must not follow a planted temp path" are
+ * testable). Every write is recorded in `writes` with its flag, so the
+ * exclusive-create contract can be asserted directly rather than inferred.
  * `contents` seeds bodies for paths in `present`; `throwReadOn` makes a read of
  * that path fail, which is the fail-soft case.
  */
@@ -42,6 +45,7 @@ function fakeFs({
   const files = new Set(present);
   const renames = [];
   const unlinked = [];
+  const writes = [];
   const body = new Map(Object.entries(contents));
   const modes = new Map();
   for (const p of present) modes.set(p, 0o644); // what Chromium's umask leaves
@@ -49,6 +53,7 @@ function fakeFs({
     files,
     renames,
     unlinked,
+    writes,
     body,
     modes,
     existsSync: (p) => files.has(p),
@@ -96,6 +101,13 @@ function fakeFs({
     },
     writeFileSync(p, data, opts) {
       if (throwWriteOn && p === throwWriteOn) throw new Error("ENOSPC");
+      const flag = opts && opts.flag !== undefined ? String(opts.flag) : "w";
+      writes.push({ path: p, flag, mode: opts && opts.mode });
+      if (flag.includes("x") && files.has(p)) {
+        const err = new Error(`EEXIST: file already exists, open '${p}'`);
+        err.code = "EEXIST";
+        throw err;
+      }
       files.add(p);
       body.set(p, String(data));
       if (opts && opts.mode !== undefined && !modes.has(p)) modes.set(p, opts.mode);
@@ -435,6 +447,43 @@ describe("redactNativeLogSecrets", () => {
     assert.equal(out.skipped, "replace-failed");
     assert.equal(fs.body.get(PREV), TOKENED_LINE);
     assert.ok(fs.unlinked.includes(TMP), "a partial temp must not be left looking like a log");
+  });
+
+  // The temp path is derived from the log path, so it is predictable. A default
+  // `w` write would follow a symlink planted there and land log contents on the
+  // link's target; O_EXCL is what refuses that.
+  it("creates the temp exclusively so a planted path is refused, not followed", () => {
+    const fs = fakeFs({ present: [PREV], contents: { [PREV]: TOKENED_LINE } });
+    redactNativeLogSecrets(PREV, { fs });
+    const tmpWrites = fs.writes.filter((w) => w.path === TMP);
+    assert.ok(tmpWrites.length > 0, "the redaction must go through the temp");
+    for (const w of tmpWrites) {
+      assert.equal(w.flag, "wx", "every temp write must be exclusive-create");
+      assert.equal(w.mode, SECRET_FILE_MODE);
+    }
+  });
+
+  // Exclusive create alone would let one crashed pass disable redaction forever,
+  // so EEXIST gets a single retry. Unlink removes the entry itself, never what it
+  // points at, and the retry is still exclusive.
+  it("clears a stale temp and retries rather than abandoning the redaction", () => {
+    const fs = fakeFs({ present: [PREV, TMP], contents: { [PREV]: TOKENED_LINE } });
+    const out = redactNativeLogSecrets(PREV, { fs });
+    assert.deepEqual(out, { scanned: true, redacted: true, skipped: null });
+    assert.ok(fs.unlinked.includes(TMP), "the stale entry must be removed, not written through");
+    assert.equal(fs.writes.filter((w) => w.path === TMP && w.flag === "wx").length, 2);
+    assert.match(fs.body.get(PREV), /token=\[REDACTED\]/);
+    assert.equal(fs.modes.get(PREV), SECRET_FILE_MODE);
+  });
+
+  it("keeps the log verbatim when the temp cannot be created exclusively", () => {
+    const fs = fakeFs({ present: [PREV, TMP], contents: { [PREV]: TOKENED_LINE } });
+    delete fs.unlinkSync; // no way to clear the blocking entry, so no retry is possible
+    const out = redactNativeLogSecrets(PREV, { fs });
+    assert.equal(out.skipped, "replace-failed");
+    assert.equal(out.redacted, false);
+    assert.equal(fs.body.get(PREV), TOKENED_LINE, "refusing to write beats writing somewhere else");
+    assert.deepEqual(fs.renames, []);
   });
 
   it("does not rewrite a log that carries no credential", () => {

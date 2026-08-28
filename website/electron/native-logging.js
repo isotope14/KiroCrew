@@ -186,9 +186,25 @@ function redactNativeLogSecrets(filePath, { fs, log = () => {} } = {}) {
     // file's mode across, so the replacement is owner-only by construction.
     // Mirrors `src/kiro_crew/atomic_write.py`, already cited by the rotation
     // comment above for the same class of failure.
+    // The temp path is predictable, so the write has to be exclusive-create:
+    // `writeFileSync`'s default `w` follows a symlink planted at that path and
+    // would land this log's contents on the link's target. `wx` (O_EXCL) refuses
+    // any pre-existing entry, symlink included, which is the same reason
+    // `createTightLogFile` below opens with `wx` rather than `w`. A stale temp
+    // from a crashed earlier pass would otherwise disable redaction forever, so
+    // EEXIST gets exactly one retry: unlink removes the entry itself — never
+    // whatever it points at — and the retry is still exclusive, so an attacker
+    // re-planting inside that window loses the race into the skip path below
+    // instead of winning a write.
     const tmpPath = `${filePath}.redact.tmp`;
     try {
-      fs.writeFileSync(tmpPath, cleaned, { mode: SECRET_FILE_MODE });
+      try {
+        fs.writeFileSync(tmpPath, cleaned, { mode: SECRET_FILE_MODE, flag: "wx" });
+      } catch (e) {
+        if (!e || e.code !== "EEXIST" || typeof fs.unlinkSync !== "function") throw e;
+        fs.unlinkSync(tmpPath);
+        fs.writeFileSync(tmpPath, cleaned, { mode: SECRET_FILE_MODE, flag: "wx" });
+      }
       fs.renameSync(tmpPath, filePath);
     } catch (e) {
       // The original is untouched on this path — that is the whole point of the
