@@ -32,15 +32,23 @@ const PREV = path.join("/logs", NATIVE_LOG_PREVIOUS_BASENAME);
  * `contents` seeds bodies for paths in `present`; `throwReadOn` makes a read of
  * that path fail, which is the fail-soft case.
  */
-function fakeFs({ present = [], throwOn = null, contents = {}, throwReadOn = null } = {}) {
+function fakeFs({
+  present = [],
+  throwOn = null,
+  contents = {},
+  throwReadOn = null,
+  throwWriteOn = null,
+} = {}) {
   const files = new Set(present);
   const renames = [];
+  const unlinked = [];
   const body = new Map(Object.entries(contents));
   const modes = new Map();
   for (const p of present) modes.set(p, 0o644); // what Chromium's umask leaves
   return {
     files,
     renames,
+    unlinked,
     body,
     modes,
     existsSync: (p) => files.has(p),
@@ -57,6 +65,12 @@ function fakeFs({ present = [], throwOn = null, contents = {}, throwReadOn = nul
         modes.set(to, modes.get(from));
         modes.delete(from);
       }
+    },
+    unlinkSync(p) {
+      unlinked.push(p);
+      files.delete(p);
+      body.delete(p);
+      modes.delete(p);
     },
     openSync(p, flag, mode) {
       if (String(flag).includes("x") && files.has(p)) {
@@ -81,6 +95,7 @@ function fakeFs({ present = [], throwOn = null, contents = {}, throwReadOn = nul
       return body.get(p) || "";
     },
     writeFileSync(p, data, opts) {
+      if (throwWriteOn && p === throwWriteOn) throw new Error("ENOSPC");
       files.add(p);
       body.set(p, String(data));
       if (opts && opts.mode !== undefined && !modes.has(p)) modes.set(p, opts.mode);
@@ -374,12 +389,52 @@ describe("redactTokensInText", () => {
 });
 
 describe("redactNativeLogSecrets", () => {
+  const TMP = `${PREV}.redact.tmp`;
+
   it("rewrites the retained log in place and tightens its mode", () => {
     const fs = fakeFs({ present: [PREV], contents: { [PREV]: TOKENED_LINE } });
     const out = redactNativeLogSecrets(PREV, { fs });
     assert.deepEqual(out, { scanned: true, redacted: true, skipped: null });
     assert.match(fs.body.get(PREV), /token=\[REDACTED\]/);
     assert.ok(!/eyJzdWIi/.test(fs.body.get(PREV)));
+  });
+
+  // NOT an in-place rewrite: writeFileSync truncates first, so a partial write
+  // would destroy the one retained generation. The sibling+rename is what makes
+  // the failure path lose the redaction instead of the evidence.
+  it("goes through an owner-only sibling and renames over the original", () => {
+    const fs = fakeFs({ present: [PREV], contents: { [PREV]: TOKENED_LINE } });
+    redactNativeLogSecrets(PREV, { fs });
+    assert.deepEqual(fs.renames, [{ from: TMP, to: PREV }]);
+    assert.equal(fs.modes.get(PREV), SECRET_FILE_MODE, "the mode rides across the rename");
+    assert.equal(fs.files.has(TMP), false, "no temp may be left behind");
+  });
+
+  it("leaves the original intact when the sibling write fails", () => {
+    const fs = fakeFs({
+      present: [PREV],
+      contents: { [PREV]: TOKENED_LINE },
+      throwWriteOn: TMP,
+    });
+    const lines = [];
+    const out = redactNativeLogSecrets(PREV, { fs, log: (m) => lines.push(m) });
+    assert.equal(out.skipped, "replace-failed");
+    assert.equal(out.redacted, false);
+    assert.equal(fs.body.get(PREV), TOKENED_LINE, "the retained evidence must survive verbatim");
+    assert.deepEqual(fs.renames, [], "nothing may be renamed over the original");
+    assert.ok(lines.some((l) => /not applied/.test(l)));
+  });
+
+  it("cleans up the temp when the rename fails", () => {
+    const fs = fakeFs({
+      present: [PREV],
+      contents: { [PREV]: TOKENED_LINE },
+      throwOn: "EPERM",
+    });
+    const out = redactNativeLogSecrets(PREV, { fs });
+    assert.equal(out.skipped, "replace-failed");
+    assert.equal(fs.body.get(PREV), TOKENED_LINE);
+    assert.ok(fs.unlinked.includes(TMP), "a partial temp must not be left looking like a log");
   });
 
   it("does not rewrite a log that carries no credential", () => {

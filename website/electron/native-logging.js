@@ -176,9 +176,32 @@ function redactNativeLogSecrets(filePath, { fs, log = () => {} } = {}) {
     const raw = fs.readFileSync(filePath, "utf8");
     const cleaned = redactTokensInText(raw);
     if (cleaned === raw) return { scanned: true, redacted: false, skipped: null };
-    // Mode is passed for the create case; `writeFileSync` leaves an existing
-    // file's mode alone, which is why tightenLogMode runs regardless below.
-    fs.writeFileSync(filePath, cleaned, { mode: SECRET_FILE_MODE });
+    // Atomic replace, NOT an in-place rewrite. `writeFileSync` truncates before
+    // it writes, so a write that fails partway (ENOSPC, EIO, a Windows sharing
+    // violation) would leave the retained log partial or empty — destroying the
+    // one generation this module exists to preserve. An unredacted log is a
+    // hygiene problem; a truncated one is the loss of the crash evidence, which
+    // is strictly worse. So: write a sibling at the tight mode, then rename over
+    // the original only once the write returned. `renameSync` carries the temp
+    // file's mode across, so the replacement is owner-only by construction.
+    // Mirrors `src/kiro_crew/atomic_write.py`, already cited by the rotation
+    // comment above for the same class of failure.
+    const tmpPath = `${filePath}.redact.tmp`;
+    try {
+      fs.writeFileSync(tmpPath, cleaned, { mode: SECRET_FILE_MODE });
+      fs.renameSync(tmpPath, filePath);
+    } catch (e) {
+      // The original is untouched on this path — that is the whole point of the
+      // sibling. Clean up the partial temp so it cannot be mistaken for a log,
+      // and report the miss rather than raising: this runs during boot.
+      try {
+        if (typeof fs.unlinkSync === "function") fs.unlinkSync(tmpPath);
+      } catch {
+        /* the temp may never have been created; nothing to clean up */
+      }
+      log(`native log redaction not applied at ${filePath}: ${e && e.message}`);
+      return { scanned: true, redacted: false, skipped: "replace-failed" };
+    }
     return { scanned: true, redacted: true, skipped: null };
   } catch (e) {
     log(`native log redaction failed at ${filePath}: ${e && e.message}`);
