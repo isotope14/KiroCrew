@@ -10,8 +10,13 @@ const {
   previousNativeLogPath,
   nativeLoggingSwitches,
   rotateNativeLog,
+  redactTokensInText,
+  redactNativeLogSecrets,
+  createTightLogFile,
   NATIVE_LOG_BASENAME,
   NATIVE_LOG_PREVIOUS_BASENAME,
+  SECRET_FILE_MODE,
+  MAX_REDACT_BYTES,
 } = require("../native-logging");
 
 const LIVE = path.join("/logs", NATIVE_LOG_BASENAME);
@@ -20,19 +25,65 @@ const PREV = path.join("/logs", NATIVE_LOG_PREVIOUS_BASENAME);
 /**
  * fs double over an in-memory file set, recording renames.
  * `present` lists paths that exist; `throwOn` makes renameSync fail.
+ *
+ * Also models the three things the credential-hygiene path needs: file CONTENT
+ * (so a redaction can be observed), file MODE (so a tightening can be), and
+ * `wx` create semantics (so "must not truncate an existing log" is testable).
+ * `contents` seeds bodies for paths in `present`; `throwReadOn` makes a read of
+ * that path fail, which is the fail-soft case.
  */
-function fakeFs({ present = [], throwOn = null } = {}) {
+function fakeFs({ present = [], throwOn = null, contents = {}, throwReadOn = null } = {}) {
   const files = new Set(present);
   const renames = [];
+  const body = new Map(Object.entries(contents));
+  const modes = new Map();
+  for (const p of present) modes.set(p, 0o644); // what Chromium's umask leaves
   return {
     files,
     renames,
+    body,
+    modes,
     existsSync: (p) => files.has(p),
     renameSync(from, to) {
       if (throwOn) throw new Error(throwOn);
       renames.push({ from, to });
       files.delete(from);
       files.add(to);
+      if (body.has(from)) {
+        body.set(to, body.get(from));
+        body.delete(from);
+      }
+      if (modes.has(from)) {
+        modes.set(to, modes.get(from));
+        modes.delete(from);
+      }
+    },
+    openSync(p, flag, mode) {
+      if (String(flag).includes("x") && files.has(p)) {
+        const err = new Error(`EEXIST: file already exists, open '${p}'`);
+        err.code = "EEXIST";
+        throw err;
+      }
+      files.add(p);
+      body.set(p, "");
+      if (mode !== undefined) modes.set(p, mode);
+      return 1;
+    },
+    closeSync() {},
+    chmodSync(p, mode) {
+      modes.set(p, mode);
+    },
+    statSync(p) {
+      return { size: Buffer.byteLength(body.get(p) || "", "utf8") };
+    },
+    readFileSync(p) {
+      if (throwReadOn && p === throwReadOn) throw new Error("EIO");
+      return body.get(p) || "";
+    },
+    writeFileSync(p, data, opts) {
+      files.add(p);
+      body.set(p, String(data));
+      if (opts && opts.mode !== undefined && !modes.has(p)) modes.set(p, opts.mode);
     },
   };
 }
@@ -160,7 +211,17 @@ describe("initNativeLogging", () => {
   it("rotates before arming the switches", () => {
     const { fs } = harness();
     assert.deepEqual(fs.renames, [{ from: LIVE, to: PREV }]);
-    assert.equal(fs.files.has(LIVE), false);
+  });
+
+  // The live path is deliberately re-created after the rotation (empty, 0600) so
+  // Chromium opens an inode that is already owner-only. Before that, Chromium
+  // created it at the process umask — 0644 for a file that records the session
+  // token on every renderer console line.
+  it("leaves the live log pre-created at an owner-only mode", () => {
+    const { fs } = harness();
+    assert.equal(fs.files.has(LIVE), true, "Chromium must open an inode we already tightened");
+    assert.equal(fs.modes.get(LIVE), 0o600);
+    assert.equal(fs.body.get(LIVE), "", "pre-creation must not add content of its own");
   });
 
   // A boot-path helper must never be the reason the app fails to start.
@@ -214,6 +275,21 @@ describe("initNativeLogging", () => {
     assert.ok(lines.some((l) => /NOT armed/.test(l)));
   });
 
+  // The pre-create is skipped on the same fail-safe reasoning as the sink: the
+  // un-rotated file still holds the session we were trying to preserve, so this
+  // boot must not open it, tighten it, or write a byte into it.
+  it("does not pre-create or rewrite the live log when rotation was blocked", () => {
+    const fs = fakeFs({
+      present: [LIVE],
+      contents: { [LIVE]: "prior session evidence" },
+      throwOn: "EPERM",
+    });
+    const { result } = harness({ fs });
+    assert.equal(result.blocked, true);
+    assert.equal(fs.body.get(LIVE), "prior session evidence");
+    assert.equal(fs.modes.get(LIVE), 0o644, "an untouched file keeps the mode it had");
+  });
+
   // Minidumps go to their own directory and are unaffected by the log file, so a
   // blocked rotation must not leave a crash this boot completely undocumented.
   it("still arms minidumps when the file sink is skipped", () => {
@@ -248,6 +324,163 @@ describe("initNativeLogging", () => {
       lines.find((l) => /native logging armed/.test(l)),
       /previous=none/
     );
+  });
+});
+
+// A real line, as Chromium writes it: the token is not something the app logs
+// deliberately — `INFO:CONSOLE` appends the document URL, and the desktop app
+// loads the dashboard as `?token=<jwt>`, so every renderer console message from
+// that document records the session token.
+const TOKENED_LINE =
+  '[123:0828/122558.487579:INFO:CONSOLE:0] "ResizeObserver loop completed with undelivered ' +
+  'notifications.", source: http://localhost:5476/chat/gateway?token=eyJzdWIiOiJVMEJRQTNYUkI4RCJ9' +
+  ".MgrpIEuHoX7bVuGcQSmK7xqK4tytvtrZiXvy7NtEesw&sid=chat-155-1787945035 (0)";
+
+describe("redactTokensInText", () => {
+  it("replaces the token value and stops at the next parameter", () => {
+    const out = redactTokensInText(TOKENED_LINE);
+    assert.match(out, /\?token=\[REDACTED\]&sid=chat-155-1787945035/);
+    assert.ok(!/eyJzdWIi/.test(out), "no part of the JWT may survive");
+  });
+
+  it("keeps everything around the token intact", () => {
+    const out = redactTokensInText(TOKENED_LINE);
+    assert.match(out, /INFO:CONSOLE:0/);
+    assert.match(out, /ResizeObserver loop completed/);
+    assert.match(out, /http:\/\/localhost:5476\/chat\/gateway/);
+  });
+
+  it("redacts every occurrence, not just the first", () => {
+    const out = redactTokensInText("a?token=AAA b\nc?token=BBB d");
+    assert.equal(out, "a?token=[REDACTED] b\nc?token=[REDACTED] d");
+  });
+
+  it("covers the &token= and access_token= spellings", () => {
+    assert.equal(redactTokensInText("x?a=1&token=ZZZ"), "x?a=1&token=[REDACTED]");
+    assert.equal(redactTokensInText("x?access_token=ZZZ"), "x?access_token=[REDACTED]");
+  });
+
+  // The pattern is deliberately narrow. A broad "anything JWT-shaped" rule would
+  // start eating legitimate log content, which is the opposite of the goal.
+  it("leaves a line with no query token untouched", () => {
+    const line = "[1:0828/1:INFO:CONSOLE:0] plain message, source: http://localhost:5476/ (0)";
+    assert.equal(redactTokensInText(line), line);
+  });
+
+  it("does not throw on nullish input", () => {
+    assert.equal(redactTokensInText(null), "");
+    assert.equal(redactTokensInText(undefined), "");
+  });
+});
+
+describe("redactNativeLogSecrets", () => {
+  it("rewrites the retained log in place and tightens its mode", () => {
+    const fs = fakeFs({ present: [PREV], contents: { [PREV]: TOKENED_LINE } });
+    const out = redactNativeLogSecrets(PREV, { fs });
+    assert.deepEqual(out, { scanned: true, redacted: true, skipped: null });
+    assert.match(fs.body.get(PREV), /token=\[REDACTED\]/);
+    assert.ok(!/eyJzdWIi/.test(fs.body.get(PREV)));
+  });
+
+  it("does not rewrite a log that carries no credential", () => {
+    const clean = "[1:0828/1:INFO:CONSOLE:0] nothing to see, source: http://localhost:5476/ (0)";
+    const fs = fakeFs({ present: [PREV], contents: { [PREV]: clean } });
+    assert.deepEqual(redactNativeLogSecrets(PREV, { fs }), {
+      scanned: true,
+      redacted: false,
+      skipped: null,
+    });
+    assert.equal(fs.body.get(PREV), clean, "an untouched log must stay byte-identical");
+  });
+
+  // Reading the file costs its size in memory, at boot, on a host that may
+  // already be under pressure. Past the cap the honest trade is unredacted
+  // evidence over an out-of-memory launch.
+  it("skips a log past the size cap rather than reading it into memory", () => {
+    const fs = fakeFs({ present: [PREV], contents: { [PREV]: TOKENED_LINE } });
+    fs.statSync = () => ({ size: MAX_REDACT_BYTES + 1 });
+    const lines = [];
+    const out = redactNativeLogSecrets(PREV, { fs, log: (m) => lines.push(m) });
+    assert.equal(out.skipped, "too-large");
+    assert.equal(out.redacted, false);
+    assert.ok(lines.some((l) => /over cap/.test(l)));
+  });
+
+  // Boot-path posture: losing a redaction pass is worth a log line, never a
+  // failed launch.
+  it("survives an unreadable log without throwing", () => {
+    const fs = fakeFs({ present: [PREV], contents: { [PREV]: TOKENED_LINE }, throwReadOn: PREV });
+    const lines = [];
+    const out = redactNativeLogSecrets(PREV, { fs, log: (m) => lines.push(m) });
+    assert.equal(out.skipped, "error");
+    assert.ok(lines.some((l) => /redaction failed/.test(l)));
+  });
+
+  it("opts out of an fs double that cannot read or write", () => {
+    const out = redactNativeLogSecrets(PREV, { fs: { existsSync: () => true } });
+    assert.equal(out.skipped, "unsupported-fs");
+  });
+});
+
+describe("createTightLogFile", () => {
+  it("creates the log empty at owner-only mode", () => {
+    const fs = fakeFs({ present: [] });
+    const out = createTightLogFile(LIVE, { fs });
+    assert.deepEqual(out, { created: true, tightened: true });
+    assert.equal(fs.modes.get(LIVE), SECRET_FILE_MODE);
+    assert.equal(fs.body.get(LIVE), "");
+  });
+
+  // `wx`, not `w`. Truncating here would destroy exactly the evidence
+  // rotateNativeLog preserves in the blocked-rotation case.
+  it("never truncates an existing log, but still tightens it", () => {
+    const fs = fakeFs({ present: [LIVE], contents: { [LIVE]: "prior session evidence" } });
+    const out = createTightLogFile(LIVE, { fs });
+    assert.equal(out.created, false, "an existing file must not be re-created");
+    assert.equal(fs.body.get(LIVE), "prior session evidence");
+    assert.equal(fs.modes.get(LIVE), SECRET_FILE_MODE, "0644 left by an older build is upgraded");
+  });
+
+  it("survives an fs whose create fails, and still reports the chmod attempt", () => {
+    const lines = [];
+    const fs = fakeFs({ present: [] });
+    fs.openSync = () => {
+      throw new Error("EROFS");
+    };
+    const out = createTightLogFile(LIVE, { fs, log: (m) => lines.push(m) });
+    assert.equal(out.created, false);
+    assert.ok(lines.some((l) => /pre-create failed/.test(l)));
+  });
+
+  it("does nothing at all without an fs", () => {
+    assert.deepEqual(createTightLogFile(LIVE, {}), { created: false, tightened: false });
+  });
+});
+
+describe("rotateNativeLog credential hygiene", () => {
+  it("redacts and tightens the generation it just took ownership of", () => {
+    const fs = fakeFs({ present: [LIVE], contents: { [LIVE]: TOKENED_LINE } });
+    assert.equal(rotateNativeLog(LIVE, { fs }).rotated, true);
+    assert.match(fs.body.get(PREV), /token=\[REDACTED\]/);
+    assert.equal(fs.modes.get(PREV), SECRET_FILE_MODE);
+  });
+
+  // The live file belongs to Chromium's own open handle; rewriting under it would
+  // race the writer. Only the renamed copy is ours.
+  it("leaves the live file alone when there is nothing to rotate", () => {
+    const fs = fakeFs({ present: [], contents: {} });
+    assert.equal(rotateNativeLog(LIVE, { fs }).rotated, false);
+    assert.deepEqual(fs.renames, []);
+  });
+
+  it("does not touch the retained log when a needed rotation was blocked", () => {
+    const fs = fakeFs({
+      present: [LIVE],
+      contents: { [LIVE]: TOKENED_LINE },
+      throwOn: "EPERM",
+    });
+    assert.equal(rotateNativeLog(LIVE, { fs }).blocked, true);
+    assert.equal(fs.body.get(LIVE), TOKENED_LINE, "the evidence must survive untouched");
   });
 });
 
