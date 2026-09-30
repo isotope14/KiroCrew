@@ -1179,10 +1179,13 @@ class AgentConfig:
         ),
     )
     spawn_min_memory_gb: float = field(
-        default=4.0,
+        default=3.0,
         metadata=_meta(
             "Spawn Min Memory GB",
-            "Minimum available memory (GB) required to spawn a subagent. 0 disables the check.",
+            "Minimum available memory (GB) required to spawn a subagent. The "
+            "admission gate adds a reserve for dedicated starts that are still "
+            "warming up on top of this floor (see the subagents docs, Memory "
+            "guard). 0 disables the check.",
         ),
     )
     resource_pressure_gb: float = field(

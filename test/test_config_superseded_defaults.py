@@ -1432,3 +1432,33 @@ def test_the_registered_new_defaults_match_the_live_dataclass_defaults():
     assert AgentConfig.__dataclass_fields__["chat_turn_timeout_secs"].default == (
         TURN_ENTRY.new_default
     )
+
+
+# --------------------------------------------------------------------------
+# agent.spawn_min_memory_gb: 4.0 -> 3.0. Report-only, like the turn budget: a
+# stored 4.0 may be an operator's own margin on a host that swaps.
+# --------------------------------------------------------------------------
+
+
+def test_unset_spawn_floor_uses_the_lowered_default(tmp_path, monkeypatch):
+    _point_home(tmp_path, monkeypatch)
+    _write_config(tmp_path, {"agent": {}})
+    cfg = KiroCrewConfig.load()
+    assert cfg.agent.spawn_min_memory_gb == 3.0
+    cfg.save()
+    assert KiroCrewConfig.load().agent.spawn_min_memory_gb == 3.0
+
+
+def test_stored_old_spawn_floor_is_reported_without_rewriting():
+    stored = {"agent": {"spawn_min_memory_gb": 4.0}}
+    entries = superseded_default_drift(stored, acked={})
+    assert [e.dotted_key for e in entries] == ["agent.spawn_min_memory_gb"]
+    assert entries[0].new_default == 3.0
+    assert entries[0].auto_adopt is False
+    assert SD.auto_adoptable(stored) == []
+    assert stored == {"agent": {"spawn_min_memory_gb": 4.0}}
+
+
+@pytest.mark.parametrize("floor", [3.0, 2.5, 0])
+def test_a_spawn_floor_the_operator_chose_is_not_reported(floor):
+    assert superseded_default_drift({"agent": {"spawn_min_memory_gb": floor}}) == []

@@ -433,6 +433,43 @@ class TestSpawnAdmissionGate:
         )
         assert unavailable["metadata"]["min_gb"] == pytest.approx(expected_min_gb)
 
+    def test_unreadable_config_falls_back_to_the_dataclass_floor(self) -> None:
+        """The guard's config-failure fallback mirrors ``AgentConfig``'s own defaults.
+
+        When ``KiroCrewConfig.load()`` raises, the guard prices the spawn from
+        literals instead of the config. A literal that disagrees with the shipped
+        default holds an install with an unreadable config to a floor no
+        documentation names, so the fallback is pinned to the dataclass default
+        rather than to a number.
+        """
+        from kiro_crew.config.sections import AgentConfig
+
+        defaults = AgentConfig()
+        mgr = self._mgr()
+        mgr._learned_costs_gb = {}
+        seen: list[float] = []
+
+        def memory_check(*, min_gb, **_kw):
+            seen.append(min_gb)
+            return True, -1.0
+
+        with (
+            patch("kiro_crew.subagent.check_memory_available", side_effect=memory_check),
+            patch("kiro_crew.platform_compat.IS_LINUX", True),
+            patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg,
+            patch("kiro_crew.subagent.cached_admission_check", return_value=_refused()),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+        ):
+            mock_cfg.load.side_effect = RuntimeError("config unreadable")
+            mock_sel.return_value.log_tool_invocation = MagicMock()
+
+            info = mgr.spawn(task="test task", parent_session_key="sess-1")
+
+        assert info is not None
+        # Floor plus one unlearned pending start, both read off the dataclass.
+        expected = defaults.spawn_min_memory_gb + defaults.subagent_cost_gb
+        assert seen == [pytest.approx(expected)]
+
     def test_low_memory_deferral_names_the_learned_price(self) -> None:
         """A deferral says what one start was priced at and where that came from.
 

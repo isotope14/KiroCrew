@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         QUEUED_REASON_CONCURRENCY_LIMIT,
         QUEUED_REASON_LOW_MEMORY,
         QUEUED_REASON_POSTURE_CRITICAL,
+        AgentConfig,
         KiroCrewConfig,
         ParentSpawnPolicy,
         SubagentInfo,
@@ -754,9 +755,14 @@ class _GateMixin(ManagerComponent):
             # sweep, never here.
             startup_cost = _startup_cost_gb(memory_cfg, learned_cost)
         except Exception:
-            min_mem = 4.0
-            configured_cost = 0.5
-            startup_cost = 0.5
+            # An unreadable config prices the spawn from the shipped defaults:
+            # the dataclass carries them without a file, so the floor, the
+            # per-start cost and the startup price read off it exactly as they
+            # read off a loaded config.
+            defaults = AgentConfig()
+            min_mem = defaults.spawn_min_memory_gb
+            configured_cost = float(defaults.subagent_cost_gb)
+            startup_cost = _startup_cost_gb(defaults, learned_cost)
         # What the next start is really priced at once live dedicated peaks
         # are folded in -- the figure the reserve uses and the one reported.
         next_start_price = _effective_next_start_gb(

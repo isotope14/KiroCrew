@@ -306,6 +306,18 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
         new_default=1000,
         changed_in="#12203",
     ),
+    # A stored 4.0 puts the spawn floor where the macOS probe (free + purgeable
+    # + file-backed inactive pages) typically reads on a 16 GB host in ordinary
+    # desktop use, so with the 0.5 GB reserve per warming start most spawns sit
+    # in the low-memory deferral while the kernel itself reports normal pressure.
+    # Report-only: a stored 4.0 may also be an operator's deliberate safety
+    # margin on a host that swaps, and value equality cannot tell the two apart.
+    SupersededDefault(
+        dotted_key="agent.spawn_min_memory_gb",
+        old_default=4.0,
+        new_default=3.0,
+        changed_in="#15270",
+    ),
 )
 
 

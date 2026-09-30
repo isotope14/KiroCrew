@@ -75,7 +75,7 @@ cap      = clamp( mem_term, 3, hard_cap )
   a hard floor: `compute_max_subagents` clamps to `[3, hard_cap]`, and the
   config loader clamps `subagent_auto_max` itself UP to 3 (with a warning) if a
   file sets it lower. The per-spawn memory gate (`agent.spawn_min_memory_gb`)
-  still refuses individual spawns under real memory pressure.
+  still defers individual spawns under real memory pressure.
 - **`hard_cap`** — an absolute ceiling (see "Why a hard cap" below).
 
 ## Learned Per-Agent Cost
@@ -148,7 +148,7 @@ deliberate v1 simplification we may revisit.
 | `agent.subagent_cost_gb` | `0.5` | First-boot memory-cost fallback (GB/agent) until learned |
 | `agent.subagent_cpu_cost_cores` | `1.0` | **Deprecated, inert.** CPU no longer sizes the cap; kept so an existing config is not rewritten |
 | `agent.subagent_auto_max` | `32` | Absolute ceiling on the computed cap (provider-concurrency stand-in) |
-| `agent.spawn_min_memory_gb` | `4.0` | Per-spawn admission gate (separate runtime guard, refuses a spawn when free memory is low) |
+| `agent.spawn_min_memory_gb` | `3.0` | Per-spawn admission gate (separate runtime guard; a spawn that would leave less than this floor plus the warming-start reserve waits in the durable queue, legacy spawns are refused) |
 | `agent.subagent_spawn_stagger_secs` | `0.25` | Delay between successive spawns (initial fill and queued drain), so a high cap never bursts on cold start |
 | `session.pool_size` | `0` | Warm-pool size; reserved in the memory term when > 0 |
 
